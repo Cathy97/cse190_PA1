@@ -36,7 +36,7 @@ namespace badgerdb {
 
 
     BufMgr::~BufMgr() {
-        std::uint32_t i;
+        FrameId i;
         BufDesc* tmpBufDesc;
         for(i = 0; i < numBufs; i++){
             tmpBufDesc = &bufDescTable[i];
@@ -47,6 +47,7 @@ namespace badgerdb {
         }
         delete[] bufDescTable;
         delete[] bufPool;
+        delete hashTable;
     }
 
     void BufMgr::advanceClock()
@@ -57,7 +58,7 @@ namespace badgerdb {
 
     void BufMgr::allocBuf(FrameId & frame)
     {
-        std::uint32_t numFrame = 0;
+        FrameId numFrame = 0;
         bool isAvailable = false;
         do{
             advanceClock();
@@ -104,12 +105,11 @@ namespace badgerdb {
         //case 2:page in buffer pool
         try{
             hashTable->lookup(file,pageNo,frameNo);
-
-            bufDescTable[frameNo].refbit=1;
+            bufDescTable[frameNo].refbit=true;
             bufDescTable[frameNo].pinCnt++;
             page = &bufPool[frameNo];
         }
-        catch (HashNotFoundException e){
+        catch (const HashNotFoundException& e){
             allocBuf(frameNo);
             //read page to the new allocated frame
             bufPool[frameNo] = file->readPage(pageNo);
@@ -130,44 +130,53 @@ namespace badgerdb {
     {
         //look for the place of the page in the buffer pool
         //throw an exception if page not found in framepool and do nothing
-        FrameId frameNo = 0;
-        hashTable->lookup(file,pageNo,frameNo);
+        try {
+            FrameId frameNo = 0;
+            hashTable->lookup(file,pageNo,frameNo);
 
-        //set the dirty bit if the passed in dirty is true
-        if(dirty == true){
-            bufDescTable[frameNo].dirty = true;
+            //set the dirty bit if the passed in dirty is true
+            if(dirty == true){
+                bufDescTable[frameNo].dirty = true;
+            }
+
+            //if pincount is already 0, then throw an exception and no need to decrease pincnt
+            if(bufDescTable[frameNo].pinCnt == 0){
+                throw PageNotPinnedException(file->filename(),pageNo,frameNo);
+            }
+            else{
+                bufDescTable[frameNo].pinCnt--;
+            }
+            return;
+        }
+        catch (const HashNotFoundException& e){
+            return;
         }
 
-        //if pincount is already 0, then throw an exception and no need to decrease pincnt
-        if(bufDescTable[frameNo].pinCnt == 0){
-            throw PageNotPinnedException(file->filename(),pageNo,frameNo);
-        }
-        else{
-            bufDescTable[frameNo].pinCnt--;
-        }
-        return;
+
     }
 
     void BufMgr::flushFile(const File* file)
     {
-        std::uint32_t i;
+        FrameId i;
         BufDesc* tmpBufDesc;
         for(i=0; i < numBufs; i++){
             tmpBufDesc = &bufDescTable[i];
-            if(tmpBufDesc->file == file && tmpBufDesc->valid == false){
-                throw BadBufferException(tmpBufDesc->frameNo,tmpBufDesc->dirty,tmpBufDesc->valid,tmpBufDesc->refbit);
-            }
-            else if(tmpBufDesc->file == file && tmpBufDesc->valid == true){
-                if(tmpBufDesc->pinCnt > 0){
-                    throw PagePinnedException(file->filename(),tmpBufDesc->pageNo,tmpBufDesc->frameNo);
+            if(tmpBufDesc->file == file) {
+                if (tmpBufDesc->valid == false) {
+                    throw BadBufferException(tmpBufDesc->frameNo, tmpBufDesc->dirty, tmpBufDesc->valid,
+                                             tmpBufDesc->refbit);
+                } else {
+                    if (tmpBufDesc->pinCnt > 0) {
+                        throw PagePinnedException(file->filename(), tmpBufDesc->pageNo, tmpBufDesc->frameNo);
+                    }
+                    if (tmpBufDesc->dirty == true) {
+                        //Page newPage = tmpBufDesc->file->allocatePage();
+                        tmpBufDesc->file->writePage(bufPool[i]);
+                        tmpBufDesc->dirty = false;
+                    }
+                    hashTable->remove(file, tmpBufDesc->pageNo);
+                    tmpBufDesc->Clear();
                 }
-                if(tmpBufDesc->dirty == true){
-                    //Page newPage = tmpBufDesc->file->allocatePage();
-                    tmpBufDesc->file->writePage(bufPool[i]);
-                    tmpBufDesc->dirty = false;
-                }
-                hashTable->remove(file,tmpBufDesc->pageNo);
-                tmpBufDesc->Clear();
             }
         }
         return;
@@ -193,20 +202,25 @@ namespace badgerdb {
 
     void BufMgr::disposePage(File* file, const PageId PageNo)
     {
-        //check if it is in the frame pool, if not, exit through the exception
-        FrameId frameNo = 0;
-        hashTable->lookup(file,PageNo,frameNo);
+        try {
+            //check if it is in the frame pool, if not, exit through the exception
+            FrameId frameNo = 0;
+            hashTable->lookup(file,PageNo,frameNo);
 
-        //clear the page from frame if found
-        bufDescTable[frameNo].Clear();
+            //clear the page from frame if found
+            bufDescTable[frameNo].Clear();
 
-        //delete the entry in the hashtable of the found frame
-        hashTable->remove(file,PageNo);
+            //delete the entry in the hashtable of the found frame
+            hashTable->remove(file,PageNo);
 
-        //delete page from its file
-        file->deletePage(PageNo);
+            //delete page from its file
+            file->deletePage(PageNo);
+            return;
+        } catch (const HashNotFoundException& e){return;}
 
-        return;
+
+
+
     }
 
     void BufMgr::printSelf(void)
